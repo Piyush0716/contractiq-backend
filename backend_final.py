@@ -12,7 +12,7 @@ from typing import Optional
 # ── Config ─────────────────────────────────────────────────────
 SUPABASE_URL = "https://wqaiziymroogggjyalqe.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndxYWl6aXltcm9vZ2dnanlhbHFlIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NzY5NDc0MSwiZXhwIjoyMDkzMjcwNzQxfQ.yr_zuS5wXB2KkabMAmZbE0dvqvGz2VMWNrf6U__qUrg"
-GROQ_KEY     = "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"
+GROQ_KEY     = "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"
 MODEL        = "llama-3.3-70b-versatile"
 
 HEADERS = {
