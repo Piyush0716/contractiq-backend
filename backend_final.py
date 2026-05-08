@@ -747,3 +747,354 @@ def dq_rules():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+# ════════════════════════════════════════════════════════════
+# SAP AGENT — endpoints start here
+# ════════════════════════════════════════════════════════════
+
+# ── DB helpers ──────────────────────────────────────────────
+def agent_sb_get(table, params=""):
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}?{params}", headers=SB_HEADERS, timeout=15)
+    return r.json() if r.status_code == 200 else []
+
+def agent_sb_post(table, data):
+    r = requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers={**SB_HEADERS, "Prefer": "return=representation"}, json=data, timeout=15)
+    return r.json(), r.status_code
+
+def agent_sb_patch(table, match_col, match_val, data):
+    r = requests.patch(f"{SUPABASE_URL}/rest/v1/{table}?{match_col}=eq.{match_val}", headers={**SB_HEADERS, "Prefer": "return=representation"}, json=data, timeout=15)
+    return r.json(), r.status_code
+
+
+# ── Models ──────────────────────────────────────────────────
+class CaseRequest(BaseModel):
+    description: str
+    request_type: Optional[str] = None
+    pdf_text: Optional[str] = None
+    case_id: Optional[str] = None
+
+class OpsAction(BaseModel):
+    case_id: str
+    action: str  # approve or modify
+    modified_summary: Optional[dict] = None
+    ops_user: Optional[str] = "Ops POC"
+
+class GoogleSheetRequest(BaseModel):
+    case_id: str
+    sheet_url: str
+
+
+# ── LLM extraction ──────────────────────────────────────────
+EXTRACT_PROMPT = """You are an expert at reading enterprise service contract requests.
+
+Given a case description (and optional PDF text), extract the following fields.
+Return ONLY valid JSON, no explanation, no markdown.
+
+Fields to extract:
+- request_type: one of [Contract Amendment, Renewal Amendment, Orders, New Business Quote, Renewal Quote]
+- contract_id: any ID starting with CTR- (null if not found)
+- quote_id: any ID starting with QT- (null if not found)
+- order_id: any ID starting with ORD- (null if not found)
+- reference_id: any ID starting with REF- (null if not found)
+- serial_numbers: list of IDs starting with SRL- (empty list if none)
+- customer_name: customer or company name mentioned (null if not found)
+- change_type: what the customer wants to do (e.g. "change quantity", "add serial", "renew contract", "refresh quote", "update customer name")
+- change_details: specific details of the change (e.g. "from 5 to 10", "remove serial SRL-XXX", "24 month renewal")
+- term_months: renewal term in months if mentioned (null if not found)
+- missing_fields: list of mandatory fields that are missing based on request_type
+
+Mandatory fields by request type:
+- Contract Amendment: contract_id + change_type
+- Renewal Amendment: quote_id OR reference_id + change_type
+- Orders: order_id OR reference_id + change_type
+- New Business Quote: customer_name + change_type
+- Renewal Quote: contract_id + change_type
+
+If request_type cannot be determined from description, set to null.
+If a mandatory field is missing, add it to missing_fields list.
+
+Description: {description}
+PDF text: {pdf_text}
+"""
+
+def extract_case(description, pdf_text=""):
+    prompt = EXTRACT_PROMPT.format(description=description, pdf_text=pdf_text or "None")
+    try:
+        resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=800,
+            temperature=0
+        )
+        text = resp.choices[0].message.content.strip()
+        text = re.sub(r'```json|```', '', text).strip()
+        return json.loads(text)
+    except Exception as e:
+        return {"error": str(e)}
+
+def validate_against_db(extracted):
+    """Validate extracted IDs against database"""
+    validation = {"found": {}, "not_found": []}
+    
+    if extracted.get("contract_id"):
+        cid = extracted["contract_id"]
+        rows = sb_get("contracts", f"contract_id=eq.{cid}&select=contract_id,customer_name,product_description,quantity,contract_status,contract_end_date,asset_serial_number")
+        if rows:
+            validation["found"]["contract"] = rows[0]
+        else:
+            validation["not_found"].append(f"Contract {cid} not found in database")
+    
+    if extracted.get("quote_id"):
+        qid = extracted["quote_id"]
+        rows = sb_get("quotes", f"quote_id=eq.{qid}&select=quote_id,customer_name,product_description,quantity,quote_status,term_months,reference_id")
+        if rows:
+            validation["found"]["quote"] = rows[0]
+        else:
+            validation["not_found"].append(f"Quote {qid} not found in database")
+
+    if extracted.get("reference_id"):
+        refid = extracted["reference_id"]
+        # Search in both quotes and orders
+        rows = sb_get("quotes", f"reference_id=eq.{refid}&select=quote_id,customer_name,product_description,quantity,quote_status,term_months")
+        if rows:
+            validation["found"]["quote_by_ref"] = rows[0]
+        else:
+            rows = sb_get("orders", f"reference_id=eq.{refid}&select=order_id,customer_name,product_description,quantity,order_status")
+            if rows:
+                validation["found"]["order_by_ref"] = rows[0]
+            else:
+                validation["not_found"].append(f"Reference ID {refid} not found in quotes or orders")
+
+    if extracted.get("order_id"):
+        oid = extracted["order_id"]
+        rows = sb_get("orders", f"order_id=eq.{oid}&select=order_id,customer_name,product_description,quantity,order_status,reference_id")
+        if rows:
+            validation["found"]["order"] = rows[0]
+        else:
+            validation["not_found"].append(f"Order {oid} not found in database")
+    
+    return validation
+
+def build_summary(extracted, validation):
+    """Build human-readable structured summary for Ops"""
+    found = validation.get("found", {})
+    
+    rec = (found.get("contract") or found.get("quote") or 
+           found.get("quote_by_ref") or found.get("order_by_ref") or 
+           found.get("order") or {})
+    
+    return {
+        "request_type": extracted.get("request_type"),
+        "customer_name": rec.get("customer_name") or extracted.get("customer_name", "Unknown"),
+        "record_id": (extracted.get("contract_id") or extracted.get("quote_id") or 
+                     extracted.get("order_id") or extracted.get("reference_id")),
+        "product": rec.get("product_description", "—"),
+        "current_quantity": rec.get("quantity"),
+        "serial_numbers": extracted.get("serial_numbers", []),
+        "change_type": extracted.get("change_type", "—"),
+        "change_details": extracted.get("change_details", "—"),
+        "term_months": extracted.get("term_months"),
+        "db_record": rec,
+        "validated": len(validation.get("not_found", [])) == 0 and bool(found),
+        "validation_issues": validation.get("not_found", []),
+    }
+
+
+# ── Endpoints ──────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "SAP Agent"}
+
+@app.post("/process-case")
+def process_case(req: CaseRequest):
+    """Main endpoint — read case, extract, validate, return summary or escalation"""
+    
+    # Generate case ID if not provided
+    import random, string
+    case_id = req.case_id or "CASE-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    
+    # Step 1: Extract from LLM
+    extracted = extract_case(req.description, req.pdf_text)
+    if "error" in extracted:
+        return {"status": "error", "message": extracted["error"]}
+    
+    # Step 2: Check missing mandatory fields
+    missing = extracted.get("missing_fields", [])
+    if not extracted.get("request_type"):
+        missing.append("request_type — could not determine case type from description")
+    
+    if missing:
+        # Escalate back to customer
+        questions = []
+        for m in missing:
+            if "contract_id" in m.lower():
+                questions.append("Could you please provide your Contract ID? (Format: CTR-XXXXXXXX)")
+            elif "quote_id" in m.lower() or "reference_id" in m.lower():
+                questions.append("Could you please provide your Quote ID (QT-XXXXXXXX) or Reference ID (REF-XXXXXXXXXX)?")
+            elif "order_id" in m.lower():
+                questions.append("Could you please provide your Order ID (ORD-XXXXXXXX) or Reference ID (REF-XXXXXXXXXX)?")
+            elif "customer_name" in m.lower():
+                questions.append("Could you please provide your company name?")
+            elif "change_type" in m.lower():
+                questions.append("Could you please describe what change you would like to make?")
+            elif "request_type" in m.lower():
+                questions.append("Could you clarify the type of request? (e.g. contract amendment, renewal, new quote, order)")
+            else:
+                questions.append(f"Could you please provide: {m}?")
+        
+        # Save case to DB
+        case_record = {
+            "case_id": case_id,
+            "description": req.description,
+            "request_type": extracted.get("request_type"),
+            "status": "escalated_to_customer",
+            "extracted_data": json.dumps(extracted),
+            "missing_fields": json.dumps(missing),
+            "created_at": datetime.utcnow().isoformat()
+        }
+        agent_sb_post("agent_cases", case_record)
+        
+        return {
+            "status": "escalated",
+            "case_id": case_id,
+            "message": "Some required information is missing. Please provide the following:",
+            "questions": questions,
+            "extracted_so_far": extracted
+        }
+    
+    # Step 3: Validate against DB
+    validation = validate_against_db(extracted)
+    
+    # Step 4: Build summary
+    summary = build_summary(extracted, validation)
+    summary["case_id"] = case_id
+    
+    # Step 5: Save case
+    case_record = {
+        "case_id": case_id,
+        "description": req.description,
+        "request_type": extracted.get("request_type"),
+        "status": "pending_customer_confirm",
+        "extracted_data": json.dumps(extracted),
+        "summary": json.dumps(summary),
+        "created_at": datetime.utcnow().isoformat()
+    }
+    agent_sb_post("agent_cases", case_record)
+    
+    if validation.get("not_found"):
+        return {
+            "status": "validation_failed",
+            "case_id": case_id,
+            "message": "I found your request but could not validate some IDs against our database.",
+            "validation_issues": validation["not_found"],
+            "summary": summary,
+            "extracted": extracted
+        }
+    
+    return {
+        "status": "ready_for_confirm",
+        "case_id": case_id,
+        "message": "I have understood your request. Please confirm the details below before I forward to our Services team.",
+        "summary": summary
+    }
+
+@app.post("/customer-confirm/{case_id}")
+def customer_confirm(case_id: str):
+    """Customer confirms the summary — forward to Ops"""
+    agent_sb_patch("agent_cases", "case_id", case_id, {"status": "pending_ops_review"})
+    return {"status": "ok", "message": "Request forwarded to Services Operations team. You will be notified once processed."}
+
+@app.get("/ops-queue")
+def ops_queue():
+    """Ops sees all pending cases"""
+    cases = agent_sb_get("agent_cases", "status=eq.pending_ops_review&order=created_at.desc&limit=50")
+    result = []
+    for c in cases:
+        summary = json.loads(c.get("summary") or "{}")
+        result.append({
+            "case_id": c["case_id"],
+            "request_type": c.get("request_type"),
+            "status": c.get("status"),
+            "created_at": c.get("created_at"),
+            "summary": summary
+        })
+    return result
+
+@app.post("/ops-action")
+def ops_action(req: OpsAction):
+    """Ops approves or modifies a case"""
+    if req.action == "approve":
+        # Write to SAP simulation (Google Sheets via agent_cases sap_log)
+        cases = agent_sb_get("agent_cases", f"case_id=eq.{req.case_id}&select=*")
+        if not cases:
+            raise HTTPException(status_code=404, detail="Case not found")
+        
+        case = cases[0]
+        summary = json.loads(case.get("summary") or "{}")
+        
+        # Write to sap_updates table (SAP simulation)
+        sap_record = {
+            "case_id": req.case_id,
+            "request_type": case.get("request_type"),
+            "record_id": summary.get("record_id"),
+            "customer_name": summary.get("customer_name"),
+            "change_type": summary.get("change_type"),
+            "change_details": summary.get("change_details"),
+            "approved_by": req.ops_user,
+            "approved_at": datetime.utcnow().isoformat(),
+            "sap_status": "simulated_success",
+            "sap_message": f"SAP API called — {summary.get('change_type')} applied to {summary.get('record_id')}"
+        }
+        agent_sb_post("sap_updates", sap_record)
+        agent_sb_patch("agent_cases", "case_id", req.case_id, {"status": "approved_sap_updated"})
+        
+        return {
+            "status": "ok",
+            "message": f"SAP updated successfully. {summary.get('change_type')} applied to {summary.get('record_id')}.",
+            "sap_record": sap_record
+        }
+    
+    elif req.action == "modify":
+        # Ops provides corrected summary
+        if req.modified_summary:
+            agent_sb_patch("agent_cases", "case_id", req.case_id, {
+                "summary": json.dumps(req.modified_summary),
+                "status": "modified_pending_confirm"
+            })
+        return {"status": "ok", "message": "Case updated with modifications. Ready for final approval."}
+    
+    elif req.action == "final_approve":
+        cases = agent_sb_get("agent_cases", f"case_id=eq.{req.case_id}&select=*")
+        if not cases:
+            raise HTTPException(status_code=404, detail="Case not found")
+        case = cases[0]
+        summary = json.loads(case.get("summary") or "{}")
+        sap_record = {
+            "case_id": req.case_id,
+            "request_type": case.get("request_type"),
+            "record_id": summary.get("record_id"),
+            "customer_name": summary.get("customer_name"),
+            "change_type": summary.get("change_type"),
+            "change_details": summary.get("change_details"),
+            "approved_by": req.ops_user,
+            "approved_at": datetime.utcnow().isoformat(),
+            "sap_status": "simulated_success",
+            "sap_message": f"SAP API called (post-modification) — {summary.get('change_type')} applied to {summary.get('record_id')}"
+        }
+        agent_sb_post("sap_updates", sap_record)
+        agent_sb_patch("agent_cases", "case_id", req.case_id, {"status": "approved_sap_updated"})
+        return {"status": "ok", "message": "SAP updated successfully after modification.", "sap_record": sap_record}
+
+@app.get("/sap-log")
+def sap_log():
+    """View all SAP updates — the simulation log"""
+    updates = agent_sb_get("sap_updates", "order=approved_at.desc&limit=100")
+    return updates
+
+@app.get("/cases")
+def get_cases(status: Optional[str] = None):
+    params = f"order=created_at.desc&limit=100"
+    if status:
+        params = f"status=eq.{status}&{params}"
+    return agent_sb_get("agent_cases", params)
