@@ -11,7 +11,7 @@ from typing import Optional
 
 # ── Config ─────────────────────────────────────────────────────
 SUPABASE_URL = "https://wqaiziymroogggjyalqe.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndxYWl6aXltcm9vZ2dnanlhbHFlIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NzY5NDc0MSwiZXhwIjoyMDkzMjcwNzQxfQ.yr_zuS5wXB2KkabMAmZbE0dvqvGz2VMWNrf6U__qUrg"
+SUPABASE_KEY = "sb_secret_R_mcP6nHrmXLxfnHJVio3w_DJHwvzfK"
 GROQ_KEY     = "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"
 MODEL        = "llama-3.3-70b-versatile"
 
@@ -943,7 +943,7 @@ def process_case(req: CaseRequest):
             else:
                 questions.append(f"Could you please provide: {m}?")
         
-        # Save case to DB
+        # Save case to DB (silent fail if Supabase unreachable)
         case_record = {
             "case_id": case_id,
             "description": req.description,
@@ -953,7 +953,8 @@ def process_case(req: CaseRequest):
             "missing_fields": json.dumps(missing),
             "created_at": datetime.utcnow().isoformat()
         }
-        agent_sb_post("agent_cases", case_record)
+        try: agent_sb_post("agent_cases", case_record)
+        except: pass
         
         return {
             "status": "escalated",
@@ -970,7 +971,7 @@ def process_case(req: CaseRequest):
     summary = build_summary(extracted, validation)
     summary["case_id"] = case_id
     
-    # Step 5: Save case
+    # Step 5: Save case (silent fail if Supabase unreachable)
     case_record = {
         "case_id": case_id,
         "description": req.description,
@@ -980,7 +981,8 @@ def process_case(req: CaseRequest):
         "summary": json.dumps(summary),
         "created_at": datetime.utcnow().isoformat()
     }
-    agent_sb_post("agent_cases", case_record)
+    try: agent_sb_post("agent_cases", case_record)
+    except: pass
     
     if validation.get("not_found"):
         return {
@@ -1002,7 +1004,8 @@ def process_case(req: CaseRequest):
 @app.post("/customer-confirm/{case_id}")
 def customer_confirm(case_id: str):
     """Customer confirms the summary — forward to Ops"""
-    agent_sb_patch("agent_cases", "case_id", case_id, {"status": "pending_ops_review"})
+    try: agent_sb_patch("agent_cases", "case_id", case_id, {"status": "pending_ops_review"})
+    except: pass
     return {"status": "ok", "message": "Request forwarded to Services Operations team. You will be notified once processed."}
 
 @app.get("/ops-queue")
@@ -1046,8 +1049,10 @@ def ops_action(req: OpsAction):
             "sap_status": "simulated_success",
             "sap_message": f"SAP API called — {summary.get('change_type')} applied to {summary.get('record_id')}"
         }
-        agent_sb_post("sap_updates", sap_record)
-        agent_sb_patch("agent_cases", "case_id", req.case_id, {"status": "approved_sap_updated"})
+        try: agent_sb_post("sap_updates", sap_record)
+        except: pass
+        try: agent_sb_patch("agent_cases", "case_id", req.case_id, {"status": "approved_sap_updated"})
+        except: pass
         
         return {
             "status": "ok",
@@ -1082,8 +1087,10 @@ def ops_action(req: OpsAction):
             "sap_status": "simulated_success",
             "sap_message": f"SAP API called (post-modification) — {summary.get('change_type')} applied to {summary.get('record_id')}"
         }
-        agent_sb_post("sap_updates", sap_record)
-        agent_sb_patch("agent_cases", "case_id", req.case_id, {"status": "approved_sap_updated"})
+        try: agent_sb_post("sap_updates", sap_record)
+        except: pass
+        try: agent_sb_patch("agent_cases", "case_id", req.case_id, {"status": "approved_sap_updated"})
+        except: pass
         return {"status": "ok", "message": "SAP updated successfully after modification.", "sap_record": sap_record}
 
 @app.get("/sap-log")
